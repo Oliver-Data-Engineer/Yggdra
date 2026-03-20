@@ -1,0 +1,63 @@
+
+        <html>
+        <head>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; line-height: 1.6; }
+            .container { width: 90%; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+            .header { background-color: #232f3e; color: white; padding: 15px; border-radius: 5px 5px 0 0; }
+            .status-sucesso { color: #28a745; font-weight: bold; }
+            .status-erro { color: #dc3545; font-weight: bold; }
+            table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+            th { background-color: #f4f4f4; color: #555; }
+            tr:nth-child(even) { background-color: #fafafa; }
+            .footer { margin-top: 30px; font-size: 0.8em; color: #777; border-top: 1px solid #eee; padding-top: 10px; }
+            .error-box { background-color: #fff5f5; border-left: 5px solid #dc3545; padding: 10px; margin-top: 10px; }
+        </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2>Yggdra Data Factory - Relatório de Execução </h2>
+                </div>
+                <p><b>Status Global:</b> <span class="status-sucesso">✅ SUCESSO</span></p>
+                
+                <h3>📋 Parâmetros do Job</h3>
+                <ul>
+                    <li><b>Tabela: </b> <code>workspace_db.tb_visao_cliente_completa</code></li>
+                    <li><b>Owner: </b>Guilherme</li>
+                    <li><b>Tipo Partição: </b> <code>anomesdia</code></li>
+                    <li><b>Início: </b> 20/03/2026 00:00:57</li>
+                    <li><b>Duração Total: </b> 0.0s</li>
+                </ul>
+
+                <h3>🗂️ Detalhes do Processamento</h3>
+                <table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>Partição</th>
+      <th>Status</th>
+      <th>Tempo (s)</th>
+      <th>Query ID</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>`2023-10-01`</td>
+      <td>✅ Sucesso</td>
+      <td>12.5s</td>
+      <td><a href="https://console.aws.amazon.com/athena/home#query/history/[abc-123-uuid](https://console.aws.amazon.com/athena/home#query/history/abc-123-uuid)" target="_blank">[abc-123-uuid](https://console.aws.amazon.com/athena/home#query/history/abc-123-uuid)</a></td>
+    </tr>
+  </tbody>
+</table>
+
+                
+
+                <div class="footer">
+                    <p>Este é um relatório automático gerado pelo motor <b>YGGDRA DATA FACTORY</b>.<br>
+                    <i>Data de geração: 20/03/2026 00:00:57</i></p>
+                </div>
+            </div>
+        </body>
+        </html>
+        
