@@ -327,6 +327,52 @@ class AthenaManager(AWSClient):
         
         return ddl_completo
     
+    def fetch_scalar(self, sql: str, database: str, temp_s3: str) -> str:
+        """
+        Executa uma query no Athena e retorna o primeiro valor da primeira coluna (escalar).
+        Ideal para queries de agregação rápida como COUNT(*), MAX() ou MIN().
+        
+        :param sql: A query a ser executada.
+        :param database: O banco de dados de contexto.
+        :param temp_s3: Caminho temporário no S3 para o Athena gravar os metadados.
+        :return: O valor retornado como string (ex: '1540'). Retorna '0' se vier vazio.
+        """
+        self.logger.info("⚡ [AthenaManager] Executando query escalar (Scalar Fetch)...")
+        
+        try:
+            # 1. Aciona o seu método padrão que executa a query e aguarda o status SUCCEEDED
+            resp = self.execute_query(sql=sql, database=database, output_s3=temp_s3)
+            query_id = resp.get('query_id')
+            
+            if not query_id:
+                raise RuntimeError("Falha na execução: Nenhum Query ID retornado pelo Athena.")
+                
+            # 2. Pede à API da AWS os resultados reais daquela execução
+            response = self.client.get_query_results(
+                QueryExecutionId=query_id,
+                MaxResults=5 # Limitamos a 5 porque só queremos a primeira linha mesmo, economiza rede!
+            )
+            
+            # 3. Navega no labirinto do JSON do Boto3
+            rows = response.get('ResultSet', {}).get('Rows', [])
+            
+            # Se tiver mais de 1 linha (Cabeçalho + Dados)
+            if len(rows) > 1:
+                # Extrai o bloco de dados da Linha 1 (índice 1)
+                data_columns = rows[1].get('Data', [])
+                if data_columns:
+                    # Pega o 'VarCharValue' da Coluna 0 (índice 0)
+                    scalar_value = data_columns[0].get('VarCharValue', '0')
+                    return scalar_value
+            
+            # Retorno seguro caso a query não devolva linhas
+            self.logger.warning(f"⚠️ Query escalar retornou VAZIO. Query ID: {query_id}")
+            return "0"
+
+        except Exception as e:
+            self.logger.error(f"❌ Erro ao tentar extrair resultado escalar da query no Athena: {e}")
+            raise
+    
     
     def count_linhas_particao(self, database: str, tabela: str, particao: Dict[str, str], output_s3: str, workgroup: str = "primary") -> Dict[str, Any]:
         """
@@ -459,3 +505,49 @@ class AthenaManager(AWSClient):
         except Exception as e:
             self.logger.error(f"❌ Falha ao extrair DDL de {db}.{table}: {e}")
             raise RuntimeError(f"Erro ao extrair DDL: {e}")
+    
+    def validate_query(self, sql: str, database: str, temp_s3: str) -> Dict[str, Any]:
+        """
+        Executa um EXPLAIN na query para validar sintaxe, semântica e existência
+        das tabelas/colunas subjacentes sem processar os dados reais.
+        
+        Padrão 'Fail Fast' para evitar custos no Athena.
+        
+        :param sql: A query SQL original que será testada.
+        :param database: O banco de dados de contexto.
+        :param temp_s3: Caminho S3 para o output temporário do Athena.
+        :return: Dicionário contendo o status de validação e a mensagem de erro (se houver).
+        """
+        self.logger.info("🧪 Validando a estrutura da query no Athena (EXPLAIN)...")
+        
+        # 1. Limpeza preventiva: Removemos espaços e o ';' final para não quebrar o EXPLAIN
+        clean_sql = sql.strip().rstrip(';')
+        
+        # 2. Monta a query de validação
+        explain_sql = f"EXPLAIN {clean_sql};"
+        
+        try:
+            # 3. Executa a query usando o nosso motor padrão
+            resp = self.execute_query(
+                sql=explain_sql, 
+                database=database, 
+                output_s3=temp_s3
+            )
+            
+            self.logger.info("✅ Query validada com sucesso! Estrutura e origens estão corretas.")
+            return {
+                "is_valid": True,
+                "error": None,
+                "query_id": resp.get('query_id')
+            }
+
+        except Exception as e:
+            # O execute_query já lança uma exceção se a AWS retornar FAILED.
+            error_msg = str(e)
+            self.logger.error(f"❌ Falha na validação da Query. O Athena recusou a execução.")
+            
+            return {
+                "is_valid": False,
+                "error": error_msg,
+                "query_id": None
+            }

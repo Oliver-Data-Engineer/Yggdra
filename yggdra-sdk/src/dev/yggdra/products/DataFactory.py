@@ -133,7 +133,7 @@ class DataFactory:
     # 🧩 Operação Isolada (Incremental)
     # ================================================================
     def _process_single_partition(self, part: str) -> dict:
-        """Processa o fluxo ETL de ponta a ponta para uma única partição (UNLOAD)."""
+        """Processa o fluxo ETL de ponta a ponta para uma única partição (UNLOAD + Data Quality)."""
         self.logger.info(f" >>> Iniciando processamento da Partição: {part}")
 
         # 1. Limpeza preventiva no S3 (Usa estritamente o nome físico da coluna)
@@ -164,6 +164,13 @@ class DataFactory:
             partition_val=part
         )
 
+        # 5. 💡 NOVO: Validação de Qualidade de Dados (Data Quality)
+        # Como está aqui, roda em paralelo junto com as outras threads!
+        linhas_gravadas = self._validate_partition_data(partition_val=part)
+        
+        # Injeta o valor no dicionário de resposta para o orquestrador capturar
+        resp['row_count'] = linhas_gravadas
+
         return resp
 
     # ================================================================
@@ -182,12 +189,29 @@ class DataFactory:
             for future in concurrent.futures.as_completed(future_to_part):
                 part = future_to_part[future]
                 try:
+                    # 1. Pega o resultado do UNLOAD (athena)
                     resp = future.result()
+                    
+                    # 2. 💡 NOVO: Aciona a validação de dados para contar as linhas
+                    row_count = self._validate_partition_data(partition_val=part)
+                    
+                    # 3. 💡 NOVO: Avalia se gravou algo ou se gravou "vento"
+                    if row_count > 0:
+                        status = "Success"
+                        self.logger.info(f"✅ Partição {part} validada com sucesso! ({row_count} linhas em {resp.get('elapsed_sec', 0)}s).")
+                    else:
+                        status = "Empty"
+                        self.logger.warning(f"⚠️ Partição {part} rodou sem erros de sintaxe, mas retornou 0 linhas.")
+                        # Opcional: Descomente a linha abaixo se quiser que partições vazias deixem o status global do job como ERROR
+                        # self.report.add_error(f"Data Quality ({part})", "A partição foi gerada sem dados (0 linhas).")
+
+                    # 4. Grava no relatório (Você pode adaptar o add_partition_result para receber o row_count no futuro)
                     self.report.add_partition_result(
-                        part, "Success", resp['elapsed_sec'], resp['query_id']
+                        part, status, resp.get('elapsed_sec', 0), resp.get('query_id', 'N/A')
                     )
-                    self.logger.info(f"✅ Partição {part} processada com sucesso em {resp['elapsed_sec']}s.")
+
                 except Exception as e:
+                    # Captura falhas estruturais (ex: erro de sintaxe, S3 indisponível)
                     self.logger.error(f"❌ Falha na partição {part}: {e}")
                     self.report.add_error(f"Partição {part}", str(e))
 
@@ -221,15 +245,28 @@ class DataFactory:
             sql_params=parametros_sql_ctas
         )
 
+        # =================================================================
+        # 💡 NOVO: Validação de Qualidade de Dados (Data Quality) pós-CTAS
+        # =================================================================
+        linhas_iniciais = self._validate_partition_data(partition_val=p_inicial)
+        
+        # Define o status visual baseado na existência de dados
+        status_ctas = "First Load (CTAS)" if linhas_iniciais > 0 else "Empty (CTAS)"
+
+        # 2. Grava no Relatório HTML (incluindo a contagem de linhas)
         self.report.add_partition_result(
-            p_inicial, "First Load (CTAS)", resp['elapsed_sec'], resp['query_id']
+            partition=p_inicial, 
+            status=status_ctas, 
+            duration=resp.get('elapsed_sec', 0), 
+            query_id=resp.get('query_id', 'N/A'),
+            row_count=linhas_iniciais  # 💡 Injetando a métrica no HTML
         )
 
-        # 2. Registra metadados e DDL da tabela recém-criada
+        # 3. Registra metadados e DDL da tabela recém-criada
         self._handle_metadata()
         self.logger.info("Tabela construída com sucesso no AWS Glue Catalog.")
 
-        # 3. 🧠 O GATILHO: Se sobraram partições, manda para o processamento paralelo
+        # 4. 🧠 O GATILHO: Se sobraram partições, manda para o processamento paralelo
         if self.partitions:
             self.logger.info(f"Redirecionando as {len(self.partitions)} partições restantes para processamento incremental.")
             self._process_incremental()
@@ -352,6 +389,48 @@ class DataFactory:
             content=metadata_json,
             extension="json"
         )
+    
+    def _validate_partition_data(self, partition_val: str) -> int:
+        """
+        Executa um COUNT(*) na partição recém-processada para garantir 
+        que dados reais foram gravados no Data Lake.
+        """
+        self.logger.info(f"🔎 [Data Quality] Contando volume gravado na partição: {partition_val}...")
+
+        db = self.job_args['db']
+        table = self.job_args['table_name']
+        p_name = self.job_args['partition_name']
+
+        # Monta a query direcionada exclusivamente à partição alvo para economizar processamento
+        sql_count = f"SELECT COUNT(*) as qtd_linhas FROM {db}.{table} WHERE {p_name} = '{partition_val}'"
+
+        try:
+            # 💡 Substitua 'fetch_scalar' pelo método correspondente no seu AthenaManager 
+            # que retorna o valor de uma coluna (ex: usando awswrangler.athena.read_sql_query)
+            resultado = self.athena.fetch_scalar(
+                sql=sql_count, 
+                database=db, 
+                temp_s3=self.data_setup['structure']['temp']
+            )
+
+            qtd_linhas = int(resultado) if resultado else 0
+
+            # Veredito de Qualidade
+            if qtd_linhas == 0:
+                msg_erro = f"ALERTA: A partição '{partition_val}' foi gerada com 0 linhas. O cruzamento pode estar quebrado."
+                self.logger.warning(f"⚠️ {msg_erro}")
+                
+                # Registra como erro no relatório final
+                self.report.add_error(f"Data Quality ({partition_val})", msg_erro)
+            else:
+                self.logger.info(f"✅ Partição '{partition_val}' validada com sucesso! Linhas gravadas: {qtd_linhas}")
+
+            return qtd_linhas
+
+        except Exception as e:
+            self.logger.error(f"❌ Falha ao tentar contar linhas da partição {partition_val}: {e}")
+            self.report.add_error(f"Data Quality ({partition_val})", f"Erro ao executar COUNT(*): {str(e)}")
+            return 0
 
     # ================================
     # 📊 Finalização
