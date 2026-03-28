@@ -193,24 +193,37 @@ class AthenaManager(AWSClient):
         parts = s3_uri.replace("s3://", "").split("/", 1)
         return parts[1] if len(parts) > 1 else ""
 
-    def manage_partition(self, db: str, table: str, partition_val: Any) -> Dict:
-        """Gerencia partições no Glue com medição de tempo de resposta do SDK."""
+    def manage_partition(self, db: str, table: str, partition_name: str, partition_val: Any) -> Dict:
+        """Gerencia partições no Glue Catalog de forma totalmente dinâmica."""
+        self.logger.info(f"🧩 Gerenciando partição '{partition_name}={partition_val}' na tabela {db}.{table}...")
+        
         cronometro = Clock()
         cronometro.start()
         
+        self.logger.debug("Buscando metadados e StorageDescriptor da tabela no AWS Glue...")
         desc = self.glue.get_description_table(db, table)
         new_sd = copy.deepcopy(desc["StorageDescriptor"])
+        
         base_location = new_sd["Location"].rstrip("/")
-        new_sd["Location"] = f"{base_location}/anomes={partition_val}/"
+        
+        # 💡 AGORA É 100% DINÂMICO!
+        target_location = f"{base_location}/{partition_name}={partition_val}/"
+        new_sd["Location"] = target_location
+        
+        self.logger.debug(f"Mapeando partição para o path S3: {target_location}")
 
         try:
+            self.logger.debug("Tentando CRIAR a partição no catálogo...")
             self.glue.client.create_partition(
                 DatabaseName=db,
                 TableName=table,
                 PartitionInput={"Values": [str(partition_val)], "StorageDescriptor": new_sd}
             )
             status = "Created"
+            self.logger.info(f"✅ Partição '{partition_name}={partition_val}' CRIADA com sucesso no Glue Catalog.")
+            
         except self.glue.client.exceptions.AlreadyExistsException:
+            self.logger.info(f"🔄 Partição '{partition_name}={partition_val}' já existe. Executando ATUALIZAÇÃO (Update)...")
             self.glue.client.update_partition(
                 DatabaseName=db,
                 TableName=table,
@@ -218,8 +231,15 @@ class AthenaManager(AWSClient):
                 PartitionInput={"Values": [str(partition_val)], "StorageDescriptor": new_sd}
             )
             status = "Updated"
+            self.logger.info(f"✅ Partição '{partition_name}={partition_val}' ATUALIZADA com sucesso no Glue Catalog.")
+
+        except Exception as e:
+            self.logger.error(f"❌ Falha ao gerenciar a partição '{partition_name}={partition_val}': {e}")
+            raise
 
         cronometro.stop()
+        self.logger.debug(f"⏱️ Tempo de resposta da API do Glue: {cronometro.elapsed_seconds}s")
+        
         return {
             "partition": partition_val, 
             "status": status, 

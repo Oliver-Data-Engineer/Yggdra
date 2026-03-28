@@ -52,6 +52,8 @@ class DataFactory:
         self.athena = None
         self.glue = None
         self.report = None
+        self.guardian = None
+
 
         # Runtime
         self.data_setup = {}
@@ -77,16 +79,55 @@ class DataFactory:
         )
         self.report = ReportManager(self.job_args)
 
+        self.guardian = SourceGuardian(region_name=self.job_args.get('region_name'))
+
+    def _register_origens(self):
+            """
+            Mapeia a linhagem de dados (Upstream) analisando a query original e 
+            salva o resultado (origens.json) no S3 para uso futuro pelo Heimdall.
+            Também injeta a linhagem no ReportManager para o relatório HTML final.
+            """
+            self.logger.info("🗺️ [SourceGuardian] Iniciando mapeamento de linhagem (Upstream)...")
+            
+            try:
+                # 1. Extrai a linhagem usando o motor do Guardian
+                query = self.data_setup.get('query')
+                lineage = self.guardian.map_upstream_lineage(query)
+                
+                # 💡 NOVO: Injeta os dados mapeados no relatório para aparecer no HTML!
+                self.report.set_lineage(lineage)
+                
+                # 2. Definição segura dos caminhos do S3
+                bucket = self.data_setup.get('bucket')
+                project_path = self.data_setup.get('project_path') 
+                
+                # O prefixo é a pasta onde o arquivo vai ficar (ex: workspace_db/tb_vendas/config)
+                prefix = f"{project_path}/config"
+                filename = "origens"
+                
+                # 3. Salva o arquivo JSON formatado e legível
+                # json.dumps com indent=4 deixa o arquivo bonito caso alguém abra direto no AWS S3
+                s3_uri = self.s3.write_text_file(
+                    bucket_name=bucket,
+                    prefix=prefix,
+                    filename=filename,
+                    content=json.dumps(lineage, indent=4, ensure_ascii=False),
+                    extension=".json"
+                )
+                
+                self.logger.info(f"✅ Arquivo de origens (linhagem) salvo com sucesso em: {s3_uri}")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Falha ao tentar mapear ou salvar a linhagem de dados: {e}")
+                # Registra o erro no relatório final sem quebrar o pipeline
+                self.report.add_error("Mapeamento de Linhagem (SourceGuardian)", str(e))
+
 
     def _setup_environment(self):
         self.logger.info("Executando setup do ambiente (Bootstrap S3/SQL)...")
         arq = S3Arquiteture(self.job_args).run()
         self.data_setup = arq
-        guardian = SourceGuardian(region_name=self.job_args.get('region_name'))
-        lineage = guardian.map_upstream_lineage(self.data_setup['query'])
-        
-        # 2. 💡 INJETA A LINHAGEM NO RELATÓRIO
-        self.report.set_lineage(lineage)
+        self._register_origens()
 
         # =================================================================
         # 📸 NOVO: Acionando o backup do código fonte e propriedades do Job
@@ -161,6 +202,7 @@ class DataFactory:
         self.athena.manage_partition(
             db=self.job_args['db'],
             table=self.job_args['table_name'],
+            partition_name=self.job_args['partition_name'], # 💡 INJETANDO O NOME DA COLUNA AQUI!
             partition_val=part
         )
 
@@ -189,32 +231,33 @@ class DataFactory:
             for future in concurrent.futures.as_completed(future_to_part):
                 part = future_to_part[future]
                 try:
-                    # 1. Pega o resultado do UNLOAD (athena)
+                    # 1. Pega o resultado do UNLOAD que veio do _process_single_partition
                     resp = future.result()
                     
-                    # 2. 💡 NOVO: Aciona a validação de dados para contar as linhas
-                    row_count = self._validate_partition_data(partition_val=part)
+                    # 2. 💡 CORREÇÃO: Lê o row_count que já foi calculado na thread, em vez de recalcular!
+                    row_count = resp.get('row_count', 0)
                     
-                    # 3. 💡 NOVO: Avalia se gravou algo ou se gravou "vento"
+                    # 3. Define o status visual
                     if row_count > 0:
                         status = "Success"
                         self.logger.info(f"✅ Partição {part} validada com sucesso! ({row_count} linhas em {resp.get('elapsed_sec', 0)}s).")
                     else:
                         status = "Empty"
                         self.logger.warning(f"⚠️ Partição {part} rodou sem erros de sintaxe, mas retornou 0 linhas.")
-                        # Opcional: Descomente a linha abaixo se quiser que partições vazias deixem o status global do job como ERROR
-                        # self.report.add_error(f"Data Quality ({part})", "A partição foi gerada sem dados (0 linhas).")
 
-                    # 4. Grava no relatório (Você pode adaptar o add_partition_result para receber o row_count no futuro)
+                    # 4. 💡 CORREÇÃO: Injetando explicitamente os parâmetros nomeados no ReportManager!
                     self.report.add_partition_result(
-                        part, status, resp.get('elapsed_sec', 0), resp.get('query_id', 'N/A')
+                        partition=part, 
+                        status=status, 
+                        elapsed=resp.get('elapsed_sec', 0), 
+                        query_id=resp.get('query_id', 'N/A'),
+                        row_count=row_count  # <-- É ISSO QUE ESTAVA FALTANDO!
                     )
 
                 except Exception as e:
-                    # Captura falhas estruturais (ex: erro de sintaxe, S3 indisponível)
                     self.logger.error(f"❌ Falha na partição {part}: {e}")
                     self.report.add_error(f"Partição {part}", str(e))
-
+                    
     # ================================
     # 🧱 First Load (CTAS Híbrido)
     # ================================
@@ -257,7 +300,7 @@ class DataFactory:
         self.report.add_partition_result(
             partition=p_inicial, 
             status=status_ctas, 
-            duration=resp.get('elapsed_sec', 0), 
+            elapsed=resp.get('elapsed_sec', 0), 
             query_id=resp.get('query_id', 'N/A'),
             row_count=linhas_iniciais  # 💡 Injetando a métrica no HTML
         )

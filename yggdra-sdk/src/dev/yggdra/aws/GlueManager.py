@@ -100,21 +100,21 @@ class GlueManager(AWSClient):
     def get_last_n_partitions(self, db: str, table: str, limit: int = 3, partition_keys: Optional[List[str]] = None) -> List[str]:
         """
         Busca as últimas N partições registradas no AWS Glue Catalog para uma tabela.
-        Usa paginação otimizada e ordenação decrescente para garantir os dados mais recentes.
+        Trata nativamente partições compostas (ex: ['2026', '03'] -> '2026/03').
         
         :param db: Nome do banco de dados no Glue.
         :param table: Nome da tabela.
         :param limit: Quantidade de partições para retornar (Padrão: 3).
         :param partition_keys: (Opcional) Lista de chaves para log/filtro avançado.
-        :return: Lista com os valores das últimas N partições (ex: ['2024-03-01', '2024-02-01', '2024-01-01']).
+        :return: Lista com os valores das últimas N partições formatadas.
         """
-        self.logger.debug(f"🔍 Buscando as últimas {limit} partições para a tabela {db}.{table} no Glue Catalog...")
+        self.logger.debug(f"🔍 Buscando as últimas {limit} partições para {db}.{table}...")
         
         try:
-            # 1. Instancia o paginador nativo do boto3 para lidar com tabelas grandes
+            # 1. Instancia o paginador nativo do boto3
             paginator = self.client.get_paginator('get_partitions')
             
-            # 2. ExcludeColumnSchema=True é vital para performance! Traz apenas o metadado enxuto.
+            # 2. Performance: ExcludeColumnSchema=True evita baixar todo o esquema da tabela a cada página
             page_iterator = paginator.paginate(
                 DatabaseName=db,
                 TableName=table,
@@ -126,36 +126,35 @@ class GlueManager(AWSClient):
             # 3. Varre as páginas retornadas pela AWS
             for page in page_iterator:
                 for partition in page.get('Partitions', []):
-                    # O Glue retorna uma lista de valores (ex: se for particionado por ano e mes: ['2024', '03'])
+                    # O Glue retorna uma lista (ex: ['2024', '03'] ou ['2024-03-01'])
                     vals = partition.get('Values', [])
                     
                     if vals:
-                        # Junta com '/' caso seja partição múltipla. 
-                        # Se for partição simples (ex: '2024-03-01'), o join apenas retorna o valor.
-                        joined_val = "/".join(vals)
+                        # 💡 A MÁGICA DA INTEGRAÇÃO: Normaliza partições múltiplas e simples
+                        # Transforma listas do Glue em strings padronizadas para o Heimdall/DataUtils
+                        joined_val = "/".join([str(v) for v in vals])
                         all_partitions.append(joined_val)
             
-            # 4. Ordenação Lexicográfica (Funciona perfeitamente para datas ISO e numéricos)
-            # reverse=True garante que as maiores (mais recentes) fiquem no topo da lista.
+            # 4. Ordenação Lexicográfica no Client-Side
+            # O Glue não garante a ordem no get_partitions, então ordenamos a lista localmente.
+            # reverse=True garante que as mais recentes (ex: 2026/12) fiquem no topo.
             all_partitions.sort(reverse=True)
             
-            # 5. Fatiamento (Slice) para pegar apenas o limite exigido
+            # 5. Fatiamento (Slice)
             ultimas_particoes = all_partitions[:limit]
             
-            self.logger.debug(f"✅ Partições encontradas para {table}: {ultimas_particoes}")
+            self.logger.debug(f"✅ Partições encontradas: {ultimas_particoes}")
             return ultimas_particoes
 
         except self.client.exceptions.EntityNotFoundException:
-            self.logger.warning(f"⚠️ Tabela {db}.{table} não encontrada no Glue Catalog.")
+            self.logger.warning(f"⚠️ Tabela {db}.{table} não encontrada no Glue Catalog (Pode ser o First Load).")
             return []
         except Exception as e:
             self.logger.error(f"❌ Erro ao buscar partições de {db}.{table}: {e}")
             return []
             
-    # Opcional: Se algum código legado seu ainda chamar get_last_partition (singular), 
-    # você pode criar um "wrapper" para não quebrar compatibilidade:
     def get_last_partition(self, db: str, table: str, **kwargs) -> Optional[str]:
-        """Wrapper de retrocompatibilidade para buscar apenas a última partição."""
+        """Wrapper de retrocompatibilidade. Retorna apenas a partição mais recente."""
         ultimas = self.get_last_n_partitions(db, table, limit=1)
         return ultimas[0] if ultimas else None
 

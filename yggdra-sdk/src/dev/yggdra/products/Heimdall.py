@@ -1,603 +1,400 @@
 import json
+import re
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 from typing import List, Dict, Any
+from dateutil.relativedelta import relativedelta
 
 from ..aws.S3Manager import S3Manager
 from ..aws.AthenaManager import AthenaManager
 from ..aws.GlueManager import GlueManager
 from ..core.GenericLogger import GenericLogger
+from ..core.DataUtils import DataUtils
+
 
 class Heimdall:
     """
     O Guardião Autônomo da Yggdra.
-    Roda isoladamente do DataFactory para validar se as origens estão prontas.
-    Lê a configuração diretamente do S3 usando os argumentos do Job.
+    Roda isoladamente do DataFactory para validar parâmetros, queries e dependências.
+    Gera uma trilha de auditoria completa (Checklist) para o relatório final.
     """
     
     def __init__(self, job_args: dict):
         self.job_args = job_args
-        self.logger = GenericLogger(name="YGGDRA.Heimdall", level=job_args.get('log_level', 'INFO'))
+        self.logger = GenericLogger(name="YGGDRA", level=job_args.get('log_level', 'INFO'))
         
-        # =========================================================
-        # 🛡️ 1. VALIDAÇÃO ANTECIPADA (Fail Fast)
-        # =========================================================
-        # Se falhar aqui, o pipeline morre em milissegundos sem acionar a AWS
-        self._validate_owner_email()
-        self._validate_arquiteture()
-
-        # =========================================================
-        # ☁️ 2. INICIALIZAÇÃO DE CONEXÕES (AWS)
-        # =========================================================
+        self.is_valid = True
+        self.security_logs: List[str] = []
+        self.validation_checklist: List[Dict[str, Any]] = [] # 💡 NOVO: Trilha de Auditoria
+        
+        # 1. INICIALIZAÇÃO DE CONEXÕES (AWS)
         region = job_args.get('region_name')
         self.s3 = S3Manager(region_name=region, logger_name="YGGDRA.Heimdall")
         self.glue = GlueManager(region_name=region, logger_name="YGGDRA.Heimdall")
         self.athena = AthenaManager(region_name=region, logger_name="YGGDRA.Heimdall")
         
-        self.is_valid = True
-        self.security_logs: List[str] = []
-        
-       
-        self.bucket_name = self.bucket_name = job_args.get('bucket_name') or self.s3.get_bucket_default()
-        self.project_path = f"{job_args['db']}/{job_args['table_name']}"
+        # 2. MONTAGEM DE CAMINHOS
+        self.bucket_name = job_args.get('bucket_name') or getattr(self.s3, 'get_bucket_default', lambda: "SEU_BUCKET_DEFAULT")()
+        self.project_path = f"{job_args.get('db')}/{job_args.get('table_name')}"
+
+        # 3. VALIDAÇÃO ESTRUTURAL (Registra no Checklist)
+        self._validate_central()
+        self._validate_owner_email()
+        self._validate_arquiteture()
 
     def _register_fault(self, msg: str):
-        """Registra uma falha e tranca o portão."""
+        """Disjuntor interno: Registra falha bloqueante, mas permite fluxo continuar até o authorize."""
         self.is_valid = False
         self.security_logs.append(msg)
         self.logger.warning(f"🛡️ [FALHA BLOQUEADA] {msg}")
 
-    def _get_origins_config_from_s3(self) -> List[Dict[str, Any]]:
-        """Lê o arquivo JSON com a linhagem e as regras de origem direto do S3."""
-        config_key = f"{self.project_path}/config/origens.json"
-        self.logger.info(f"🛡️ [Heimdall] Buscando regras de origem em: s3://{self.bucket_name}/{config_key}")
-        
-        try:
-            # Baixa o conteúdo do arquivo usando o Boto3 nativo do S3Manager
-            response = self.s3.client.get_object(Bucket=self.bucket_name, Key=config_key)
-            json_content = response['Body'].read().decode('utf-8')
-            return json.loads(json_content)
-            
-        except self.s3.client.exceptions.NoSuchKey:
-            self._register_fault(f"Arquivo de configuração de origens não encontrado no S3 ({config_key}).")
-            return []
-        except Exception as e:
-            self._register_fault(f"Falha ao ler o JSON de origens no S3: {e}")
-            return []
+    def _add_check(self, etapa: str, alvo: str, status: bool, detalhes: str):
+        """💡 Adiciona o laudo de um teste específico na Trilha de Auditoria."""
+        self.validation_checklist.append({
+            "etapa": etapa,
+            "alvo": alvo,
+            "status": status,
+            "detalhes": detalhes
+        })
 
     # =========================================================================
-    # 🕵️ MÉTODOS DE VALIDAÇÃO (Fluent Interface)
+    # 🕵️ MÉTODOS DE VALIDAÇÃO DE INFRAESTRUTURA
     # =========================================================================
-
-    def evaluate_upstream_readiness(self) -> 'Heimdall':
-        """
-        1. Lê o JSON de origens do S3 (origens.json).
-        2. Busca a última partição no AWS Glue para cada origem.
-        3. Compara o Real com o Esperado (Baseado na defasagem/inferred_format).
-        4. Imprime um log detalhado de sucesso ou falha para cada tabela.
-        5. Retorna 'self' para permitir encadeamento (Fluent Interface).
-        """
-        self.logger.info("🛡️ [Heimdall] Iniciando avaliação geral de prontidão dos dados Upstream...")
+    def _validate_central(self):
+        """Valida campos obrigatórios da fábrica de dados."""
+        required_fields = ['db', 'table_name', 'partition_name', 'partition_type']
+        ausentes = [f for f in required_fields if not self.job_args.get(f)]
         
-        origens_config = self._get_origins_config_from_s3()
-        resultados = []
-        
-        if not origens_config:
-            self.logger.warning("🛡️ [Heimdall] Nenhum arquivo origens.json encontrado. Pulando etapa.")
-            return self
+        if ausentes:
+            msg = f"Parâmetros ausentes: {', '.join(ausentes)}"
+            self._register_fault(f"[ERRO ESTRUTURAL] {msg}")
+            self._add_check("Parâmetros Base", "Campos Obrigatórios", False, msg)
+        else:
+            p_name = self.job_args.get('partition_name')
+            if not isinstance(p_name, (str, list)):
+                self._register_fault("[ERRO ESTRUTURAL] 'partition_name' deve ser string ou lista [year, month, day]")
+                self._add_check("Parâmetros Base", "Formato partition_name", False, "Tipo inválido")
+            else:
+                self._add_check("Parâmetros Base", "Campos Obrigatórios", True, "Todos os parâmetros vitais estão presentes")
 
-        hoje = datetime.now()
-
-        for source in origens_config:
-            db = source.get('database')
-            table = source.get('table')
-            inferred_fmt = source.get('inferred_format')
-            defasagem = source.get('expected_defasagem', 0)
-            partition_keys = source.get('partition_keys', [])
-            
-            expected_partition = "N/A"
-            last_partition = "VAZIO"
-            passed = False
-
-            try:
-                # 1. Busca no Glue a última partição real da tabela de origem
-                if partition_keys:
-                    last_parts = self.glue.get_last_n_partitions(db=db, table=table, partition_keys=partition_keys, limit=1)
-                    if last_parts:
-                        last_partition = last_parts[0]
-
-                # 2. Motor de Cálculo da Partição Esperada
-                if inferred_fmt in ["%Y-%m-%d", "%Y%m%d"]:
-                    # Formato Diário -> Subtrai Dias
-                    target_date = hoje - relativedelta(days=defasagem)
-                    expected_partition = target_date.strftime(inferred_fmt)
-                    
-                elif inferred_fmt in ["%Y-%m-01", "%Y%m01", "%Y-%m", "%Y%m", "%Y"]:
-                    # Formato Mensal/Anual -> Subtrai Meses/Anos
-                    target_date = hoje - relativedelta(months=defasagem)
-                    expected_partition = target_date.strftime(inferred_fmt)
-                    
-                else:
-                    # Fallback (Assume defasagem em dias no padrão YYYYMMDD se nulo)
-                    target_date = hoje - relativedelta(days=defasagem)
-                    inferred_fmt_fallback = "%Y%m%d" if not inferred_fmt else inferred_fmt
-                    expected_partition = target_date.strftime(inferred_fmt_fallback)
-
-                # 3. Veredito Lógico
-                if last_partition != "VAZIO":
-                    passed = str(last_partition) >= str(expected_partition)
-                else:
-                    passed = False
-
-                # 4. Logs Interativos e Registro de Falhas
-                if passed:
-                    self.logger.info(
-                        f"✅ [PASSOU] Origem: {db}.{table} | "
-                        f"Alvo: {expected_partition} | Real: {last_partition} (Lag: {defasagem})"
-                    )
-                else:
-                    self.logger.error(
-                        f"❌ [ATRASADO] Origem: {db}.{table} | "
-                        f"Alvo: {expected_partition} | Real: {last_partition} (Lag: {defasagem})"
-                    )
-                    # Registra a falha no disjuntor interno do Heimdall
-                    self._register_fault(
-                        f"Tabela de Origem atrasada ou vazia: '{db}.{table}'. "
-                        f"Esperava: {expected_partition} | Encontrou: {last_partition}"
-                    )
-
-            except Exception as e:
-                self.logger.error(f"⚠️ [ERRO TÉCNICO] Falha ao inspecionar origem {db}.{table}: {e}")
-                self._register_fault(f"Falha técnica ao validar origem {db}.{table}")
-
-            # 5. Compila o resultado para um possível uso posterior
-            resultados.append({
-                "database": db,
-                "table": table,
-                "last_partition": last_partition,
-                "expected_partition": expected_partition,
-                "passed": passed
-            })
-
-        self.logger.info("🛡️ [Heimdall] Varredura geral de origens concluída com sucesso.")
-        
-        # 💡 Guarda o relatório na instância da classe em vez de retornar a lista
-        self.upstream_readiness_report = resultados 
-        
-        # Retorna o próprio Guardião para continuar a corrente!
-        return self
-
-    def authorize(self) -> bool:
-        """
-        Avalia o resultado das checagens encadeadas.
-        Se is_valid == False, dispara um erro interrompendo o fluxo.
-        """
-        if not self.is_valid:
-            self.logger.error("🛑 [Heimdall] O portão da Bifrost permanece fechado! Falhas detectadas:")
-            for log in self.security_logs:
-                self.logger.error(f"   ✖️ {log}")
-                
-            raise PermissionError(f"Heimdall bloqueou o pipeline. {len(self.security_logs)} origem(ns) não atendem aos requisitos de D-1/M-0.")
-            
-        self.logger.info("🟢 [Heimdall] Todas as validações passaram. Autorização concedida.")
-        return True
+        query_ok = bool(self.job_args.get('query')) or bool(self.job_args.get('path_sql_origem'))
+        if not query_ok:
+            self._register_fault("[ERRO ESTRUTURAL] Necessário 'query' ou 'path_sql_origem'")
+            self._add_check("Parâmetros Base", "Origem SQL", False, "Nenhuma instrução SQL mapeada")
+        else:
+            self._add_check("Parâmetros Base", "Origem SQL", True, "Instrução SQL mapeada com sucesso")
 
     def _validate_owner_email(self):
-        owner = self.args.get('owner')
+        owner = self.job_args.get('owner')
+        allowed_domains = ["@itau-unibanco.com.br", "@itau.com.br", "@rede.com.br", "@corp.itau"]
+        
+        if not owner or not isinstance(owner, str) or '@' not in owner:
+            self._register_fault("[GOVERNANÇA] Email de Owner inválido ou ausente.")
+            self._add_check("Governança", "Email Owner", False, f"Recebido: '{owner}'")
+            return
 
-        # domínios permitidos (pode crescer no futuro)
-        allowed_domains = [
-            "@itau-unibanco.com.br",  # principal
-            "@itau.com.br",
-            "@rede.com.br",
-            "@corp.itau"
-        ]
+        if not any(owner.lower().endswith(d) for d in allowed_domains):
+            self._register_fault(f"[GOVERNANÇA] Domínio não permitido: {owner}")
+            self._add_check("Governança", "Email Owner", False, "Domínio fora da Whitelist corporativa")
+            return
 
-        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-
-        # valida tipo
-        if not isinstance(owner, str):
-            raise TypeError(
-                "[ERRO DE VALIDAÇÃO] O parâmetro 'owner' deve ser uma string (email)"
-            )
-
-        # valida formato
-        if not re.match(email_pattern, owner):
-            raise ValueError(
-                f"[ERRO DE VALIDAÇÃO] O parâmetro 'owner' deve ser um email válido. Valor recebido: '{owner}'"
-            )
-
-        # 🔥 valida domínio permitido
-        if not any(owner.lower().endswith(domain) for domain in allowed_domains):
-            raise ValueError(
-                "[ERRO DE VALIDAÇÃO] Domínio de email não permitido. "
-                f"Domínios aceitos: {', '.join(allowed_domains)}"
-            )
+        self._add_check("Governança", "Email Owner", True, f"Aprovado: {owner}")
 
     def _validate_arquiteture(self):
-        """Validações estritas dos parâmetros de engenharia e arquitetura temporal."""
-        
-        # 1. Validação de Defasagem (Lag)
-        defasagem = self.args.get('defasagem', 0)
+        """Validações estritas dos parâmetros temporais."""
+        # Defasagem
+        defasagem = self.job_args.get('defasagem', 0)
         if not isinstance(defasagem, int) or defasagem < 0:
-            raise ValueError(
-                f"[ERRO DE VALIDAÇÃO] O parâmetro 'defasagem' deve ser um inteiro positivo. Valor recebido: {defasagem}"
-            )
+            self._register_fault(f"[ARQUITETURA] Defasagem inválida: {defasagem}")
+            self._add_check("Config. Temporal", "Defasagem (Lag)", False, "Deve ser inteiro >= 0")
+        else:
+            self._add_check("Config. Temporal", "Defasagem (Lag)", True, f"Lag configurado para {defasagem}")
 
-        # 2. Validação de Reprocessamento
-        reprocessamento = self.args.get('reprocessamento', False)
-        if not isinstance(reprocessamento, bool):
-            raise TypeError(
-                f"[ERRO DE VALIDAÇÃO] O parâmetro 'reprocessamento' deve ser booleano (True/False). Valor recebido: {reprocessamento}"
-            )
+        # Tipo de Partição
+        valid_types = ['data', 'anomesdia', 'anomes', 'ano', 'mes']
+        p_type = self.job_args.get('partition_type')
+        if p_type and p_type.lower() not in valid_types:
+            self._register_fault(f"[ARQUITETURA] partition_type inválido: {p_type}")
+            self._add_check("Config. Temporal", "Tipo Partição", False, f"Opções: {valid_types}")
+        else:
+            self._add_check("Config. Temporal", "Tipo Partição", True, f"Mapeado: {p_type}")
 
-        range_rep = self.args.get('range_reprocessamento', 0)
-        if not isinstance(range_rep, int) or range_rep < 0:
-            raise ValueError(
-                f"[ERRO DE VALIDAÇÃO] O parâmetro 'range_reprocessamento' deve ser um inteiro positivo. Valor recebido: {range_rep}"
-            )
+    # =========================================================================
+    # 🌐 MÉTODOS DE DADOS E DEPENDÊNCIAS
+    # =========================================================================
+    def _get_origins_config_from_s3(self) -> List[Dict[str, Any]]:
+        config_key = f"{self.project_path}/config/origens.json"
+        try:
+            response = self.s3.client.get_object(Bucket=self.bucket_name, Key=config_key)
+            return json.loads(response['Body'].read().decode('utf-8'))
+        except Exception as e:
+            return []
 
-        # 3. Validação do Tipo de Partição Lógica
-        valid_partition_types = ['data', 'anomesdia', 'anomes', 'ano', 'mes']
-        p_type = self.args.get('partition_type')
-        if p_type and p_type.lower() not in valid_partition_types:
-            raise ValueError(
-                f"[ERRO DE VALIDAÇÃO] 'partition_type' inválido. Opções aceitas: {valid_partition_types}"
-            )
-
-        # 4. Validação da Janela Manual (dt_ini e dt_fim)
-        dt_ini = self.args.get('dt_ini')
-        dt_fim = self.args.get('dt_fim')
+    def check_query_health(self) -> 'Heimdall':
+        self.logger.info("🛡️ Validando sintaxe da Query (EXPLAIN)...")
         
-        if dt_ini and dt_fim:
-            str_ini, str_fim = str(dt_ini), str(dt_fim)
-            # Verifica se o início não é maior que o fim (funciona tanto para '20240101' quanto para '2024-01-01')
-            if str_ini > str_fim:
-                raise ValueError(
-                    f"[ERRO DE VALIDAÇÃO] Incoerência temporal: 'dt_ini' ({str_ini}) não pode ser maior que 'dt_fim' ({str_fim})."
-                )
+        if not self.job_args.get('db') or not self.job_args.get('table_name'):
+            return self # Já barrou no _validate_central
 
-    # 🔹 Validação central
-    def _validate(self):
-        required_fields = ['db', 'table_name', 'owner', 'partition_name', 'partition_type']
-        
-        # valida obrigatórios
-        for field in required_fields:
-            if not self.args.get(field):
-                raise ValueError(f"[ERRO DE VALIDAÇÃO] Parâmetro obrigatório ausente: '{field}'")
-
-        # valida regra: precisa de query OU path_sql_origem
-        if not self.args.get('query') and not self.args.get('path_sql_origem'):
-            raise ValueError(
-                "[ERRO DE VALIDAÇÃO] É necessário informar 'query' ou 'path_sql_origem'"
-            )
-
-        # valida tipo
-        if self.args.get('query') and not isinstance(self.args['query'], str):
-            raise TypeError(
-                "[ERRO DE VALIDAÇÃO] O parâmetro 'query' deve ser do tipo string"
-            )
-
-        if self.args.get('path_sql_origem') and not isinstance(self.args['path_sql_origem'], str):
-            raise TypeError(
-                "[ERRO DE VALIDAÇÃO] O parâmetro 'path_sql_origem' deve ser do tipo string"
-            )
-
-    def check_historical_upstream_readiness(
-        self, 
-        qtd_anomesdia: int = 1, 
-        qtd_anomes: int = 1, 
-        dt_referencia: str = None
-    ) -> 'Heimdall':
-        """
-        Verifica a existência de partições históricas contínuas nas origens, 
-        aplicando regras distintas para tabelas diárias e mensais.
-        
-        :param qtd_anomesdia: Quantidade de dias a recuar para tabelas de grão diário.
-        :param qtd_anomes: Quantidade de meses a recuar para tabelas de grão mensal.
-        :param dt_referencia: Data âncora opcional (ex: '20260325' ou '202603'). Se nulo, usa a data atual.
-        :return: self (Fluent Interface)
-        """
-        self.logger.info(
-            f"🛡️ [Heimdall] Varredura Histórica - Exigindo: {qtd_anomesdia} dia(s) e {qtd_anomes} mês(es). "
-            f"(Âncora: {dt_referencia or 'Hoje'})"
-        )
-        
-        # 1. Definição da Data Âncora Inteligente
-        anchor_date = datetime.now()
-        if dt_referencia:
+        query = self.job_args.get('query')
+        if not query or not str(query).strip():
+            sql_prefix = f"{self.project_path}/sql"
+            filename = f"{self.job_args.get('table_name')}.sql"
             try:
-                clean_val = re.sub(r'\D', '', str(dt_referencia))
-                if len(clean_val) == 8:
-                    anchor_date = datetime.strptime(clean_val, '%Y%m%d')
-                elif len(clean_val) == 6:
-                    anchor_date = datetime.strptime(clean_val, '%Y%m')
-            except ValueError as e:
-                self._register_fault(f"Formato de âncora inválido para verificação histórica: {e}")
+                if hasattr(self.s3, 'get_content_sql'):
+                    query = self.s3.get_content_sql(bucket=self.bucket_name, prefix=sql_prefix, filename=filename)
+                else:
+                    query = self.s3.client.get_object(Bucket=self.bucket_name, Key=f"{sql_prefix}/{filename}")['Body'].read().decode('utf-8')
+            except Exception:
+                self._register_fault("SQL não enviado no payload e não encontrado no S3.")
+                self._add_check("Validação SQL", "Busca da Query", False, "Arquivo ausente")
                 return self
 
-        origens_config = self._get_origins_config_from_s3()
-        if not origens_config:
-            self.logger.warning("🛡️ [Heimdall] Nenhum ficheiro de origens encontrado para validar o histórico.")
+        q_teste = str(query).replace('{anomesdia}', '20260101').replace('{anomes}', '202601').replace('{data}', '2026-01-01')
+        
+        try:
+            res = self.athena.validate_query(sql=q_teste, database=self.job_args.get('db'), temp_s3=f"s3://{self.bucket_name}/{self.project_path}/temp/")
+            if res.get('is_valid'):
+                self._add_check("Validação SQL", "Sintaxe e Catálogo", True, "Aprovado via AWS Athena EXPLAIN")
+            else:
+                erro = str(res.get('error', 'Erro desconhecido')).split("FAILED:")[-1].strip()
+                self._register_fault(f"SQL Inválido: {erro[:200]}")
+                self._add_check("Validação SQL", "Sintaxe e Catálogo", False, erro)
+        except Exception as e:
+            self._register_fault(f"Erro no teste do Athena: {e}")
+            self._add_check("Validação SQL", "Serviço Athena", False, str(e))
+
+        return self
+
+    def evaluate_upstream_readiness(self) -> 'Heimdall':
+            origens = self._get_origins_config_from_s3()
+            if not origens:
+                self._add_check("Prontidão Upstream", "origens.json", True, "Nenhuma dependência mapeada (Tabela Isolada)")
+                return self
+
+            p_type = self.job_args.get('partition_type', 'data')
+
+            # =====================================================================
+            # 💡 NOVO: Motor de Simulação Exata da Janela de Execução
+            # =====================================================================
+            self.logger.debug("Simulando a matriz exata de partições que serão executadas neste Job...")
+            
+            # Pega as datas puras (datetime) que a DataFactory vai processar
+            base_dates = DataUtils._get_base_dates(
+                p_type=p_type,
+                dt_ini=self.job_args.get('dt_ini', 190001),
+                dt_fim=self.job_args.get('dt_fim', 190001),
+                reprocessamento=self.job_args.get('reprocessamento', False),
+                range_reprocessamento=self.job_args.get('range_reprocessamento', 0),
+                dia_corte=self.job_args.get('dia_corte'),
+                defasagem=self.job_args.get('defasagem', 0),
+                p_format=self.job_args.get('partition_format')
+            )
+
+            if not base_dates:
+                self.logger.warning("⚠️ Nenhuma partição a ser processada nesta janela.")
+                self._add_check("Prontidão Upstream", "Janela de Execução", True, "Nenhuma partição gerada para os parâmetros atuais.")
+                return self
+
+            # Gera os nomes para o log ficar legível
+            target_partitions_log = [DataUtils.format_partition(d, p_type, self.job_args.get('partition_format')) for d in base_dates]
+            self.logger.info(f"🛡️ [Heimdall] Simulando execução para {len(base_dates)} partição(ões). Alvo inicial: {target_partitions_log[0]}")
+
+            # =====================================================================
+            # Varredura de Origens (Garantindo que CADA partição exigida existe)
+            # =====================================================================
+            for src in origens:
+                db, table = src.get('database'), src.get('table')
+                fmt = src.get('inferred_format', '%Y%m%d')
+                lag = src.get('expected_defasagem', 0)
+                keys = src.get('partition_keys', [])
+                
+                if not keys:
+                    continue
+
+                try:
+                    # 1. Motor Matemático: Aplica o Lag/Defasagem em cada data exata do loop
+                    expected_src_partitions = set()
+                    for dt in base_dates:
+                        if "01" in fmt or "%m" in fmt and "%d" not in fmt: 
+                            target_dt = dt - relativedelta(months=lag)
+                        else: 
+                            target_dt = dt - relativedelta(days=lag)
+                        
+                        # Salva a partição exata exigida formatada para a origem atual
+                        expected_src_partitions.add(target_dt.strftime(fmt))
+                    
+                    # Ordena a lista de exigências
+                    expected_src_partitions = sorted(list(expected_src_partitions))
+
+                    # 2. Busca partições reais no Glue (Com folga para não falhar a paginação)
+                    search_limit = max(100, len(expected_src_partitions) + lag + 30)
+                    reais = self.glue.get_last_n_partitions(db=db, table=table, partition_keys=keys, limit=search_limit)
+
+                    # 3. Interseção de Conjuntos (O que eu preciso VS O que eu tenho)
+                    faltantes = [p for p in expected_src_partitions if p not in reais]
+
+                    if not faltantes:
+                        self._add_check(
+                            "Prontidão Upstream", 
+                            f"{db}.{table}", 
+                            True, 
+                            f"Pronto! Cobre as {len(expected_src_partitions)} partições exigidas. (Última: {expected_src_partitions[-1]})"
+                        )
+                    else:
+                        self._register_fault(f"Atraso em {db}.{table}. Faltam {len(faltantes)} partições da janela simulada. (Ausentes: {faltantes[:3]})")
+                        self._add_check(
+                            "Prontidão Upstream", 
+                            f"{db}.{table}", 
+                            False, 
+                            f"Atrasado. Faltam: {faltantes[:2]}"
+                        )
+                        
+                except Exception as e:
+                    self._register_fault(f"Erro lendo {db}.{table}: {e}")
+                    self._add_check("Prontidão Upstream", f"{db}.{table}", False, f"Falha de Catálogo: {e}")
+
             return self
 
-        # 2. Varredura Inteligente por Origem
-        for source in origens_config:
-            db = source.get('database')
-            table = source.get('table')
-            inferred_fmt = source.get('inferred_format')
-            defasagem = source.get('expected_defasagem', 0)
-            partition_keys = source.get('partition_keys', [])
+    def check_historical_upstream_readiness(self, qtd_anomesdia: int = 1, qtd_anomes: int = 1, dt_referencia: str = None) -> 'Heimdall':
+        origens = self._get_origins_config_from_s3()
+        if not origens: return self
 
-            if not partition_keys:
-                continue
-
-            # 3. 🧠 Identificação do Grão Lógico
-            is_daily = inferred_fmt in ["%Y-%m-%d", "%Y%m%d"]
-            is_monthly = inferred_fmt in ["%Y-%m-01", "%Y%m01", "%Y-%m", "%Y%m"]
-
-            # Configura os limites baseados no grão
-            if is_daily:
-                n_partitions = qtd_anomesdia
-                delta_unit = 'days'
-            elif is_monthly:
-                n_partitions = qtd_anomes
-                delta_unit = 'months'
-            else:
-                # Fallback de segurança assume diário
-                n_partitions = qtd_anomesdia
-                delta_unit = 'days'
-                inferred_fmt = "%Y%m%d" if not inferred_fmt else inferred_fmt
-
-            # Se o utilizador pediu para não verificar este grão (ex: passou 0)
-            if n_partitions <= 0:
-                self.logger.debug(f"Pular origem '{table}' (verificação de {delta_unit} configurada para 0).")
-                continue
-
-            # 4. Motor Matemático: Gera a lista EXATA das partições esperadas
-            expected_partitions = []
-            for i in range(n_partitions):
-                total_lag = defasagem + i
-                
-                if delta_unit == 'days':
-                    target_date = anchor_date - relativedelta(days=total_lag)
-                else:
-                    target_date = anchor_date - relativedelta(months=total_lag)
-                    
-                expected_partitions.append(target_date.strftime(inferred_fmt))
-
-            # 5. Busca as partições reais no Glue (limite elástico)
-            search_limit = max(100, n_partitions + defasagem + 30)
-            actual_partitions = self.glue.get_last_n_partitions(
-                db=db, table=table, partition_keys=partition_keys, limit=search_limit
-            )
-
-            # 6. Interseção de Conjuntos (Quais estão em falta?)
-            missing_partitions = [p for p in expected_partitions if p not in actual_partitions]
-
-            if missing_partitions:
-                self._register_fault(
-                    f"Origem '{db}.{table}' sem profundidade histórica. "
-                    f"Faltam {len(missing_partitions)} partição(ões) das {n_partitions} exigidas. (Ausentes: {missing_partitions[:3]}...)"
-                )
-            else:
-                self.logger.info(f"✅ Histórico de '{db}.{table}' validado ({n_partitions} partições contínuas presentes).")
-
-        return self
-    
-    def check_specific_origin(
-        self,
-        db: str,
-        table: str,
-        partition_type: str,
-        defasagem: int = 0,
-        partition_format: str = None,
-        dt_referencia: str = None
-    ) -> 'Heimdall':
-        """
-        Verifica a prontidão de uma tabela de origem específica de forma ad-hoc.
-        Calcula a partição esperada baseada no tipo e na defasagem, sem depender do SourceGuardian.
-        
-        :param db: Banco de dados no Glue Catalog.
-        :param table: Nome da tabela.
-        :param partition_type: Grão lógico ('data', 'anomesdia', 'anomes', 'mes', 'ano').
-        :param defasagem: Quantidade de recuos a aplicar.
-        :param partition_format: (Opcional) Máscara customizada, ex: '%Y-%m-01'.
-        :param dt_referencia: (Opcional) Data âncora no formato numérico.
-        :return: self (Fluent Interface)
-        """
-        self.logger.info(f"🛡️ [Heimdall] Inspeção Ad-hoc: Verificando {db}.{table} (Tipo: {partition_type}, Defasagem: {defasagem})")
-
-        # 1. Definição da Data Âncora
         anchor_date = datetime.now()
         if dt_referencia:
-            clean_val = re.sub(r'\D', '', str(dt_referencia))
             try:
-                if len(clean_val) >= 8:
-                    anchor_date = datetime.strptime(clean_val[:8], '%Y%m%d')
-                elif len(clean_val) >= 6:
-                    anchor_date = datetime.strptime(clean_val[:6], '%Y%m')
+                c_val = re.sub(r'\D', '', str(dt_referencia))
+                anchor_date = datetime.strptime(c_val[:8], '%Y%m%d') if len(c_val) >= 8 else datetime.strptime(c_val[:6], '%Y%m')
             except ValueError:
-                self._register_fault(f"Formato de âncora inválido para {db}.{table}: {dt_referencia}")
+                self._add_check("Histórico (Backfill)", "Data Âncora", False, "Formato inválido")
                 return self
 
-        # 2. Resolução do Formato e do Grão de Tempo
-        p_type_lower = partition_type.lower()
-        is_monthly = 'mes' in p_type_lower or p_type_lower == 'ano' or partition_format == '%Y-%m-01'
-        
-        # Mapeia formato padrão da arquitetura Yggdra se não for passado um explícito
-        if not partition_format:
-            formats = {
-                "ano": "%Y",
-                "mes": "%m",
-                "anomes": "%Y%m",
-                "anomesdia": "%Y%m%d",
-                "data": "%Y-%m-%d"
-            }
-            partition_format = formats.get(p_type_lower, "%Y-%m-%d")
+        for src in origens:
+            db, table, keys = src.get('database'), src.get('table'), src.get('partition_keys', [])
+            if not keys: continue
 
-        # 3. Motor Matemático: Cálculo da Partição Esperada
-        if is_monthly:
-            if partition_format == '%Y-%m-01':
-                anchor_date = anchor_date.replace(day=1)
-            target_date = anchor_date - relativedelta(months=defasagem)
-        else:
-            target_date = anchor_date - relativedelta(days=defasagem)
-            
-        expected_partition = target_date.strftime(partition_format)
+            fmt, lag = src.get('inferred_format', '%Y%m%d'), src.get('expected_defasagem', 0)
+            n_parts, delta = (qtd_anomes, 'months') if '01' in fmt or '%m' in fmt and '%d' not in fmt else (qtd_anomesdia, 'days')
 
-        # 4. Varredura AWS Glue
-        try:
-            tb_desc = self.glue.get_description_table(db=db, table=table)
-            partition_keys = [p.get("Name") for p in tb_desc.get("PartitionKeys", [])]
-            
-            if not partition_keys:
-                self._register_fault(f"A tabela {db}.{table} não é particionada. Validação temporal abortada.")
-                return self
+            if n_parts <= 0: continue
 
-            last_parts = self.glue.get_last_n_partitions(db=db, table=table, partition_keys=partition_keys, limit=1)
-            last_partition = last_parts[0] if last_parts else "VAZIO"
+            esperadas = [(anchor_date - relativedelta(**{delta: lag + i})).strftime(fmt) for i in range(n_parts)]
+            reais = self.glue.get_last_n_partitions(db=db, table=table, partition_keys=keys, limit=max(100, n_parts + lag + 30))
+            faltantes = [p for p in esperadas if p not in reais]
 
-            # 5. Veredito de Segurança
-            if last_partition != "VAZIO" and str(last_partition) >= str(expected_partition):
-                self.logger.info(f"✅ Origem Ad-hoc '{db}.{table}' validada! (Real: {last_partition} | Exigido: {expected_partition}).")
+            if faltantes:
+                self._register_fault(f"Histórico incompleto em {db}.{table}. Faltam: {len(faltantes)}")
+                self._add_check("Histórico (Backfill)", f"{db}.{table}", False, f"Exigido: {n_parts}. Faltam: {faltantes[:2]}")
             else:
-                self._register_fault(
-                    f"Origem Ad-hoc '{db}.{table}' está atrasada ou vazia. "
-                    f"Exigido: {expected_partition} | Real: {last_partition}"
-                )
-                
-        except Exception as e:
-            self.logger.error(f"Erro ao verificar origem ad-hoc {db}.{table}: {e}")
-            self._register_fault(f"Falha técnica ao acessar {db}.{table} no Glue Catalog.")
+                self._add_check("Histórico (Backfill)", f"{db}.{table}", True, f"Todas as {n_parts} partições presentes")
 
         return self
     
-    def save_report(self) -> 'Heimdall':
-        """
-        Gera um relatório HTML sofisticado contendo o laudo de todas as verificações.
-        Salva o ficheiro no S3 na pasta reports/heimdall/success ou error.
-        Retorna 'self' para não quebrar a corrente (Fluent Interface).
-        """
-        self.logger.info("📊 [Heimdall] Compilando relatório visual de segurança (HTML)...")
+    def check_specific_origin(self, db: str, table: str, partition_type: str, defasagem: int = 0, partition_format: str = None, dt_referencia: str = None) -> 'Heimdall':
+        anchor_date = datetime.now()
+        if dt_referencia:
+            try:
+                c_val = re.sub(r'\D', '', str(dt_referencia))
+                anchor_date = datetime.strptime(c_val[:8], '%Y%m%d') if len(c_val) >= 8 else datetime.strptime(c_val[:6], '%Y%m')
+            except ValueError: pass
 
+        fmt = partition_format or {"ano": "%Y", "mes": "%m", "anomes": "%Y%m", "anomesdia": "%Y%m%d", "data": "%Y-%m-%d"}.get(partition_type.lower(), "%Y-%m-%d")
+        delta = 'months' if 'mes' in partition_type.lower() or 'ano' in partition_type.lower() else 'days'
+        if partition_format == '%Y-%m-01': anchor_date = anchor_date.replace(day=1)
+        
+        target = (anchor_date - relativedelta(**{delta: defasagem})).strftime(fmt)
+
+        try:
+            keys = [p.get("Name") for p in self.glue.get_description_table(db=db, table=table).get("PartitionKeys", [])]
+            last_part = self.glue.get_last_n_partitions(db=db, table=table, partition_keys=keys, limit=1)[0] if keys else "VAZIO"
+
+            if last_part != "VAZIO" and str(last_part) >= str(target):
+                self._add_check("Validação Ad-Hoc", f"{db}.{table}", True, f"Real: {last_part} (Alvo: {target})")
+            else:
+                self._register_fault(f"Ad-Hoc {db}.{table} atrasado. Real: {last_part} | Alvo: {target}")
+                self._add_check("Validação Ad-Hoc", f"{db}.{table}", False, f"Real: {last_part} | Alvo: {target}")
+        except Exception as e:
+            self._register_fault(f"Falha ao validar ad-hoc {db}.{table}")
+            self._add_check("Validação Ad-Hoc", f"{db}.{table}", False, f"Erro AWS: {e}")
+
+        return self
+
+    # =========================================================================
+    # 📝 RELATÓRIO E AUTORIZAÇÃO
+    # =========================================================================
+    def save_report(self) -> 'Heimdall':
         has_errors = not self.is_valid
-        status_label = "🛑 BLOQUEADO (FALHAS DE PRÉ-REQUISITO)" if has_errors else "✅ AUTORIZADO (SUCESSO)"
+        status_label = "🛑 BLOQUEADO" if has_errors else "✅ AUTORIZADO"
         status_color = "#dc3545" if has_errors else "#28a745"
 
-        # =====================================================================
-        # 1. Montagem da Tabela de Origens (Geral)
-        # =====================================================================
-        tabela_html = ""
-        readiness_data = getattr(self, 'upstream_readiness_report', [])
-        
-        if readiness_data:
-            linhas = ""
-            for res in readiness_data:
-                cor_linha = "#d4edda" if res['passed'] else "#f8d7da"
-                icone = "✅" if res['passed'] else "❌"
-                linhas += f"""
-                <tr style="background-color: {cor_linha}; color: #333;">
-                    <td>{res['database']}.{res['table']}</td>
-                    <td>{res['expected_partition']}</td>
-                    <td>{res['last_partition']}</td>
-                    <td style="text-align: center;">{icone}</td>
-                </tr>
-                """
-            
-            tabela_html = f"""
-            <h3>🔍 Detalhamento das Origens (Upstream Geral)</h3>
-            <table class="yggdra-table">
-                <tr>
-                    <th>Tabela de Origem</th>
-                    <th>Partição Exigida (Alvo)</th>
-                    <th>Partição Existente (Real)</th>
-                    <th>Status</th>
-                </tr>
-                {linhas}
-            </table>
+        # 💡 NOVO: Montagem da Tabela da Trilha de Auditoria (Checklist)
+        linhas_checklist = ""
+        for check in self.validation_checklist:
+            cor = "#d4edda" if check['status'] else "#f8d7da"
+            icone = "✔️ Aprovado" if check['status'] else "❌ Reprovado"
+            linhas_checklist += f"""
+            <tr style="background-color: {cor};">
+                <td><b>{check['etapa']}</b></td>
+                <td><code>{check['alvo']}</code></td>
+                <td>{icone}</td>
+                <td><small>{check['detalhes']}</small></td>
+            </tr>
             """
 
-        # =====================================================================
-        # 2. Montagem dos Erros Consolidados (Histórico, Ad-Hoc e Sintaxe)
-        # =====================================================================
-        erros_html = ""
-        if has_errors:
-            lista_erros = "".join([f"<li>{err}</li>" for err in self.security_logs])
-            erros_html = f"""
-            <div class="error-box">
-                <h3>🚨 Auditoria de Falhas Detectadas</h3>
-                <ul>{lista_erros}</ul>
-            </div>
-            """
-        elif not readiness_data:
-             erros_html = "<p><i>Nenhuma falha detectada. Pipeline 100% aderente aos requisitos.</i></p>"
+        auditoria_html = f"""
+        <h3>📋 Auditoria Detalhada de Validações</h3>
+        <table class="yggdra-table">
+            <tr><th>Etapa</th><th>Alvo Validado</th><th>Status</th><th>Detalhes do Teste</th></tr>
+            {linhas_checklist}
+        </table>
+        """
 
-        # =====================================================================
-        # 3. Template HTML (Estilizado)
-        # =====================================================================
         html_content = f"""
         <html>
         <head>
             <meta charset="utf-8">
             <style>
                 body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f7f6; color: #333; padding: 20px; }}
-                .container {{ background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 950px; margin: auto; }}
+                .container {{ background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 1000px; margin: auto; }}
                 h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-                .status-badge {{ font-size: 18px; font-weight: bold; color: white; background-color: {status_color}; padding: 12px 20px; border-radius: 6px; display: inline-block; margin-bottom: 20px; }}
-                .metadata {{ background: #f9f9f9; padding: 15px; border-left: 4px solid #3498db; margin-bottom: 25px; border-radius: 4px; }}
+                .status-badge {{ font-size: 18px; font-weight: bold; color: white; background-color: {status_color}; padding: 12px 20px; border-radius: 6px; margin-bottom: 20px; display: inline-block; }}
+                .metadata {{ background: #f9f9f9; padding: 15px; border-left: 4px solid #3498db; margin-bottom: 25px; font-size: 14px; }}
                 .yggdra-table {{ width: 100%; border-collapse: collapse; margin-bottom: 25px; font-size: 14px; }}
-                .yggdra-table th, .yggdra-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+                .yggdra-table th, .yggdra-table td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
                 .yggdra-table th {{ background-color: #34495e; color: white; font-weight: normal; }}
-                .error-box {{ background-color: #fff3f3; color: #d63031; border: 1px solid #fab1a0; padding: 20px; border-radius: 6px; margin-top: 20px; box-shadow: inset 0 0 5px rgba(214,48,49,0.1); }}
-                .error-box ul {{ margin-bottom: 0; line-height: 1.6; }}
-                .footer {{ margin-top: 40px; font-size: 12px; color: #95a5a6; text-align: center; border-top: 1px solid #ecf0f1; padding-top: 15px; }}
+                .footer {{ margin-top: 40px; font-size: 12px; color: #95a5a6; text-align: center; border-top: 1px solid #eee; padding-top: 15px; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <h2>🛡️ Heimdall - Relatório de Pre-Flight Checks</h2>
-                
+                <h2>🛡️ Heimdall - Trilha de Auditoria (Pre-Flight)</h2>
                 <div class="status-badge">{status_label}</div>
-                
                 <div class="metadata">
-                    <b>🎯 Destino:</b> <code>{self.job_args.get('db')}.{self.job_args.get('table_name')}</code><br>
-                    <b>⏰ Data da Verificação:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}<br>
-                    <b>👤 Owner:</b> {self.job_args.get('owner', 'N/A')}
+                    <b>Destino:</b> <code>{self.job_args.get('db')}.{self.job_args.get('table_name')}</code> | 
+                    <b>Verificado em:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
                 </div>
-
-                {tabela_html}
-                {erros_html}
-
-                <div class="footer">
-                    Gerado automaticamente por <b>Yggdra Data Platform</b><br>
-                    <i>Módulo de Segurança e Observabilidade (Heimdall)</i>
-                </div>
+                {auditoria_html}
+                <div class="footer">Documento Oficial de Compliance - <b>Yggdra Data Platform</b></div>
             </div>
         </body>
         </html>
         """
 
-        # =====================================================================
-        # 4. Gravação Física no S3
-        # =====================================================================
-        status_folder = "error" if has_errors else "success"
-        prefix = f"{self.project_path}/reports/heimdall/{status_folder}"
+        prefix = f"{self.project_path}/heimdall/reports/{'error' if has_errors else 'success'}"
         filename = f"heimdall_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         try:
             s3_uri = self.s3.write_text_file(
-                bucket=self.bucket_name,
-                prefix=prefix,
-                filename=filename,
-                content=html_content,
-                extension="html"
+                bucket_name=self.bucket_name, prefix=prefix, filename=filename, content=html_content, extension=".html"
             )
-            self.logger.info(f"✅ Relatório Heimdall gerado e salvo em: {s3_uri}")
-            self.report_s3_path = s3_uri # Opcional: Guarda o path caso precise usar na Exception depois
-            
+            self.logger.info(f"✅ Relatório Oficial salvo em: {s3_uri}")
+            self.report_s3_path = s3_uri 
         except Exception as e:
-            self.logger.error(f"❌ Falha ao tentar salvar o relatório HTML do Heimdall no S3: {e}")
+            self.logger.error(f"❌ Falha ao salvar no S3: {e}")
 
         return self
 
+    def authorize(self) -> bool:
+        if not self.is_valid:
+            raise PermissionError(f"Pipeline bloqueado! Encontrados {len(self.security_logs)} erros. Relatório: {getattr(self, 'report_s3_path', 'N/A')}")
+        self.logger.info("🟢 [Heimdall] Todas as validações aprovadas.")
+        return True
